@@ -1,0 +1,488 @@
+{
+  "info": {
+    "name": "Schema Registry API",
+    "description": "Collection for Confluent Schema Registry API operations",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Transactions Schema",
+      "item": [
+        {
+          "name": "Register Transaction Schema (JSON)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.schemaregistry.v1+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"schema\": \"{\\\"type\\\":\\\"record\\\",\\\"name\\\":\\\"Transaction\\\",\\\"namespace\\\":\\\"local_db\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"type\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"terminal_id\\\",\\\"type\\\":\\\"long\\\"},{\\\"name\\\":\\\"received_at\\\",\\\"type\\\":{\\\"type\\\":\\\"string\\\",\\\"logicalType\\\":\\\"timestamp-millis\\\"}}]}\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8083/subjects/transactions-value/versions",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects", "transactions-value", "versions"]
+            }
+          }
+        },
+        {
+          "name": "Register Transaction Schema (Avro String)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.schemaregistry.v1+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"schema\": \"{\\\"type\\\":\\\"record\\\",\\\"name\\\":\\\"Transaction\\\",\\\"namespace\\\":\\\"local_db\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"type\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"terminal_id\\\",\\\"type\\\":\\\"long\\\"},{\\\"name\\\":\\\"received_at\\\",\\\"type\\\":\\\"string\\\"}]}\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8083/subjects/transactions-value/versions",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects", "transactions-value", "versions"]
+            }
+          }
+        },
+        {
+          "name": "Get Latest Transaction Schema",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/subjects/transactions-value/versions/latest",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects", "transactions-value", "versions", "latest"]
+            }
+          }
+        },
+        {
+          "name": "Get Transaction Schema by Version",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/subjects/transactions-value/versions/1",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects", "transactions-value", "versions", "1"]
+            }
+          }
+        },
+        {
+          "name": "Get All Transaction Schema Versions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/subjects/transactions-value/versions",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects", "transactions-value", "versions"]
+            }
+          }
+        },
+        {
+          "name": "Check Schema Compatibility",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.schemaregistry.v1+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"schema\": \"{\\\"type\\\":\\\"record\\\",\\\"name\\\":\\\"Transaction\\\",\\\"namespace\\\":\\\"local_db\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"type\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"terminal_id\\\",\\\"type\\\":\\\"long\\\"},{\\\"name\\\":\\\"received_at\\\",\\\"type\\\":\\\"string\\\"}]}\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8083/compatibility/subjects/transactions-value/versions/latest",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": [
+                "compatibility",
+                "subjects",
+                "transactions-value",
+                "versions",
+                "latest"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete Schema Version",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/subjects/transactions-value/versions/1",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects", "transactions-value", "versions", "1"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Subject Management",
+      "item": [
+        {
+          "name": "List All Subjects",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/subjects",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects"]
+            }
+          }
+        },
+        {
+          "name": "Get Subject Versions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/subjects/transactions-value/versions",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects", "transactions-value", "versions"]
+            }
+          }
+        },
+        {
+          "name": "Get Subject Config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/config/transactions-value",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["config", "transactions-value"]
+            }
+          }
+        },
+        {
+          "name": "Update Subject Config",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.schemaregistry.v1+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"compatibilityLevel\": \"BACKWARD\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8083/config/transactions-value",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["config", "transactions-value"]
+            }
+          }
+        },
+        {
+          "name": "Delete Subject",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/subjects/transactions-value",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects", "transactions-value"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Schema Management",
+      "item": [
+        {
+          "name": "Get Schema by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/schemas/ids/1",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["schemas", "ids", "1"]
+            }
+          }
+        },
+        {
+          "name": "Get Schema by ID (with type)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/schemas/ids/1?fetchMaxId=false",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["schemas", "ids", "1"],
+              "query": [
+                {
+                  "key": "fetchMaxId",
+                  "value": "false"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Schema Types",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/schemas/types",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["schemas", "types"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Compatibility",
+      "item": [
+        {
+          "name": "Get Compatibility Level",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/config",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["config"]
+            }
+          }
+        },
+        {
+          "name": "Update Compatibility Level",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.schemaregistry.v1+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"compatibilityLevel\": \"BACKWARD\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8083/config",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["config"]
+            }
+          }
+        },
+        {
+          "name": "Test Compatibility for Subject",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/vnd.schemaregistry.v1+json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"schema\": \"{\\\"type\\\":\\\"record\\\",\\\"name\\\":\\\"Transaction\\\",\\\"namespace\\\":\\\"local_db\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"type\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"terminal_id\\\",\\\"type\\\":\\\"long\\\"},{\\\"name\\\":\\\"received_at\\\",\\\"type\\\":\\\"string\\\"},{\\\"name\\\":\\\"status\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"pending\\\"}]}\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8083/compatibility/subjects/transactions-value/versions/latest",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": [
+                "compatibility",
+                "subjects",
+                "transactions-value",
+                "versions",
+                "latest"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Health & Monitoring",
+      "item": [
+        {
+          "name": "Get Schema Registry Version",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": [""]
+            }
+          }
+        },
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/subjects",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8083",
+              "path": ["subjects"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Kafka Commands",
+      "item": [
+        {
+          "name": "Create Topic",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "url": {
+              "raw": "docker exec poc-kafka kafka-topics --create --topic transactions --bootstrap-server localhost:9094 --partitions 1 --replication-factor 1",
+              "protocol": "docker exec poc-kafka kafka-topics --create --topic transactions --bootstrap-server",
+              "host": ["localhost:9094 --partitions 1 --replication-factor 1"]
+            },
+            "description": "Run this command in terminal:\n```bash\ndocker exec poc-kafka kafka-topics --create --topic transactions --bootstrap-server localhost:9094 --partitions 1 --replication-factor 1\n```"
+          }
+        },
+        {
+          "name": "List Topics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "url": {
+              "raw": "docker exec poc-kafka kafka-topics --list --bootstrap-server localhost:9094",
+              "protocol": "docker exec poc-kafka kafka-topics --list --bootstrap-server",
+              "host": ["localhost:9094"]
+            },
+            "description": "Run this command in terminal:\n```bash\ndocker exec poc-kafka kafka-topics --list --bootstrap-server localhost:9094\n```"
+          }
+        },
+        {
+          "name": "Describe Topic",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "url": {
+              "raw": "docker exec poc-kafka kafka-topics --describe --topic transactions --bootstrap-server localhost:9094",
+              "protocol": "docker exec poc-kafka kafka-topics --describe --topic transactions --bootstrap-server",
+              "host": ["localhost:9094"]
+            },
+            "description": "Run this command in terminal:\n```bash\ndocker exec poc-kafka kafka-topics --describe --topic transactions --bootstrap-server localhost:9094\n```"
+          }
+        },
+        {
+          "name": "Produce Message",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "url": {
+              "raw": "docker exec poc-kafka kafka-console-producer --topic transactions --bootstrap-server localhost:9094",
+              "protocol": "docker exec poc-kafka kafka-console-producer --topic transactions --bootstrap-server",
+              "host": ["localhost:9094"]
+            },
+            "description": "Run this command in terminal:\n```bash\ndocker exec poc-kafka kafka-console-producer --topic transactions --bootstrap-server localhost:9094\n```"
+          }
+        },
+        {
+          "name": "Consume Messages",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "url": {
+              "raw": "docker exec poc-kafka kafka-console-consumer --topic transactions --from-beginning --bootstrap-server localhost:9094",
+              "protocol": "docker exec poc-kafka kafka-console-consumer --topic transactions --from-beginning --bootstrap-server",
+              "host": ["localhost:9094"]
+            },
+            "description": "Run this command in terminal:\n```bash\ndocker exec poc-kafka kafka-console-consumer --topic transactions --from-beginning --bootstrap-server localhost:9094\n```"
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "schema_registry_url",
+      "value": "http://localhost:8083",
+      "type": "string"
+    },
+    {
+      "key": "kafka_bootstrap",
+      "value": "localhost:9094",
+      "type": "string"
+    }
+  ]
+}
