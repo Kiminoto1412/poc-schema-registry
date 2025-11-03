@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
 	"github.com/linkedin/goavro/v2"
+	"gitlab.bigc-cs.com/pos-transformation/pos-go-common/kafka"
 )
 
 func main() {
@@ -40,14 +40,15 @@ func main() {
 
 	log.Printf("✅ Got schema ID: %d", latestSchema.ID)
 
-	// --- Kafka producer ---
-	producer, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers": bootstrapServers,
+	// --- Kafka producer using common library ---
+	kafkaClient, cleanup := kafka.NewKafka(kafka.KafkaConfig{
+		Brokers:     bootstrapServers,
+		EnforceTls:  false,
+		AuthEnabled: false,
+		Retry:       3,
+		ClientID:    "transaction-service-producer",
 	})
-	if err != nil {
-		log.Fatalf("❌ Failed to create producer: %v", err)
-	}
-	defer producer.Close()
+	defer cleanup()
 
 	log.Println("✅ Connected to Kafka and Schema Registry")
 
@@ -88,28 +89,29 @@ func main() {
 		binary.Write(&schemaBuf, binary.BigEndian, int32(latestSchema.ID))
 		schemaBuf.Write(avroBytes)
 
-		value := schemaBuf.Bytes()
+		valueBytes := schemaBuf.Bytes()
 
-		msg := &kafka.Message{
-			TopicPartition: kafka.TopicPartition{
-				Topic:     &topic,
-				Partition: kafka.PartitionAny,
-			},
-			Key:   []byte(txn.ID),
-			Value: value,
-		}
+		// Convert binary data to string for common library
+		// sarama.StringEncoder will convert string back to []byte correctly
+		valueString := string(valueBytes)
 
-		if err := producer.Produce(msg, nil); err != nil {
+		// Send message using common library
+		result, err := kafkaClient.SendMessage(kafka.SendMessageParam{
+			Topic:   topic,
+			Key:     txn.ID,
+			Message: valueString,
+		})
+
+		if err != nil {
 			log.Printf("❌ Failed to send txn %d: %v", i, err)
 			continue
 		}
 
-		log.Printf("✅ Sent Txn[%d]: ID=%s Type=%s Terminal=%d",
-			i+1, txn.ID, txn.Type, txn.TerminalID)
+		log.Printf("✅ Sent Txn[%d]: ID=%s Type=%s Terminal=%d (Partition: %d, Offset: %d)",
+			i+1, txn.ID, txn.Type, txn.TerminalID, result.Partition, result.Offset)
 
 		time.Sleep(time.Second)
 	}
 
-	producer.Flush(15 * 1000)
 	log.Println("✅ All transactions sent successfully!")
 }
