@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package local_db;
+
+option go_package = "local_db/proto";
+
+// TransactionDLQ represents a dead letter queue message for failed transactions
+message TransactionDLQ {
+  string original_key = 1;
+  bytes original_value = 2;
+  string error = 3;
+  int32 original_schema_id = 4;  // Optional, use 0 for not set
+  string failed_at = 5;
+  int32 retry_count = 6;  // Optional, use 0 for not set
+}

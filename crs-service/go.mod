@@ -5,8 +5,9 @@ go 1.24.2
 require (
 	github.com/IBM/sarama v1.45.2
 	github.com/confluentinc/confluent-kafka-go/v2 v2.3.0
-	github.com/linkedin/goavro/v2 v2.14.1
 	gitlab.bigc-cs.com/pos-transformation/pos-go-common v0.0.0
+	google.golang.org/protobuf v1.36.10
+	local_db/proto v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -46,3 +47,5 @@ require (
 )
 
 replace gitlab.bigc-cs.com/pos-transformation/pos-go-common => /Users/paruj.lap/Desktop/bigc_repo/pos-go-common
+
+replace local_db/proto => ../shared/proto

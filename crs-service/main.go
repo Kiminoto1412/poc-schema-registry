@@ -17,8 +17,11 @@ import (
 
 	"github.com/IBM/sarama"
 	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
-	"github.com/linkedin/goavro/v2"
 	"gitlab.bigc-cs.com/pos-transformation/pos-go-common/kafka"
+	"google.golang.org/protobuf/proto"
+
+	// Import the generated protobuf code
+	transactionpb "local_db/proto"
 )
 
 // Transaction represents the transaction data structure
@@ -49,11 +52,9 @@ type consumerImp struct {
 	kafka        kafka.Kafka
 	srClient     schemaregistry.Client
 	latestSchema schemaregistry.SchemaMetadata
-	codec        *goavro.Codec
 	subject      string
-	// DLQ Avro support
+	// DLQ Protobuf support
 	dlqSchema  schemaregistry.SchemaMetadata
-	dlqCodec   *goavro.Codec
 	dlqSubject string
 }
 
@@ -70,16 +71,11 @@ func NewConsumer(
 	}
 	log.Printf("✅ Schema Registry connection verified (subject: %s, schema ID: %d)", subject, latestSchema.ID)
 
-	// Parse schema ด้วย goavro
-	codec, err := goavro.NewCodec(latestSchema.Schema)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse schema: %w", err)
-	}
-	log.Println("✅ Avro codec created successfully")
+	log.Println("✅ Protobuf schema ready")
 
 	// Load DLQ schema (get or register)
 	dlqSubject := fmt.Sprintf("%s-value", cfg.TopicDLQ)
-	dlqSchema, dlqCodec, err := getOrRegisterDLQSchema(srClient, dlqSubject, cfg.SchemaRegistryURL)
+	dlqSchema, err := getOrRegisterDLQSchema(srClient, dlqSubject, cfg.SchemaRegistryURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup DLQ schema: %w", err)
 	}
@@ -90,10 +86,8 @@ func NewConsumer(
 		kafka:        kafkaClient,
 		srClient:     srClient,
 		latestSchema: latestSchema,
-		codec:        codec,
 		subject:      subject,
 		dlqSchema:    dlqSchema,
-		dlqCodec:     dlqCodec,
 		dlqSubject:   dlqSubject,
 	}, nil
 }
@@ -106,7 +100,7 @@ func (c *consumerImp) Consume(ctx context.Context) {
 
 		c.kafka.RetryHandler(msg,
 			func(m *sarama.ConsumerMessage) error {
-				// Deserialize Avro message
+				// Deserialize Protobuf message
 				txn, err := c.deserializeMessage(m)
 				if err != nil {
 					log.Printf("❌ deserialize message error: %v", err)
@@ -122,11 +116,11 @@ func (c *consumerImp) Consume(ctx context.Context) {
 				return nil
 			},
 			func(m *sarama.ConsumerMessage, errMsg string) {
-				// Send to DLQ using Avro format
+				// Send to DLQ using Protobuf format
 				retryCount := 3 // Default retry count from config
-				if err := c.sendToDLQAvro(m, errMsg, retryCount); err != nil {
+				if err := c.sendToDLQProtobuf(m, errMsg, retryCount); err != nil {
 					log.Printf("❌ send to dlq error: %v", err)
-					// Fallback to JSON format if Avro fails
+					// Fallback to JSON format if Protobuf fails
 					_, fallbackErr := c.kafka.SendToDLQ(kafka.SendToDLQParam{
 						TopicDlq:     c.cfg.TopicDLQ,
 						Msg:          m,
@@ -136,7 +130,7 @@ func (c *consumerImp) Consume(ctx context.Context) {
 						log.Printf("❌ fallback DLQ also failed: %v", fallbackErr)
 					}
 				} else {
-					log.Printf("⚠️  message sent to DLQ (Avro): %s (error: %s)", string(m.Key), errMsg)
+					log.Printf("⚠️  message sent to DLQ (Protobuf): %s (error: %s)", string(m.Key), errMsg)
 				}
 			},
 		)
@@ -151,20 +145,19 @@ func (c *consumerImp) Consume(ctx context.Context) {
 }
 
 func (c *consumerImp) deserializeMessage(msg *sarama.ConsumerMessage) (Transaction, error) {
-	// Extract Schema Registry header: [magic byte][schema ID][avro data]
+	// Extract Schema Registry header: [magic byte][schema ID][protobuf data]
 	if len(msg.Value) < 5 {
 		return Transaction{}, errors.New("message too short")
 	}
 
 	magicByte := msg.Value[0]
 	schemaID := int32(msg.Value[1])<<24 | int32(msg.Value[2])<<16 | int32(msg.Value[3])<<8 | int32(msg.Value[4])
-	avroData := msg.Value[5:]
+	protoData := msg.Value[5:]
 
 	if magicByte != 0 {
 		return Transaction{}, fmt.Errorf("invalid magic byte: 0x%02x", magicByte)
 	}
 
-	currentCodec := c.codec
 	// Verify schema ID matches
 	if int(schemaID) != c.latestSchema.ID {
 		log.Printf("⚠️  Schema ID mismatch: expected %d, got %d", c.latestSchema.ID, schemaID)
@@ -173,59 +166,21 @@ func (c *consumerImp) deserializeMessage(msg *sarama.ConsumerMessage) (Transacti
 		if err != nil {
 			return Transaction{}, fmt.Errorf("failed to fetch schema ID %d: %w", schemaID, err)
 		}
-		currentCodec, err = goavro.NewCodec(schemaMeta.Schema)
-		if err != nil {
-			return Transaction{}, fmt.Errorf("failed to parse schema ID %d: %w", schemaID, err)
-		}
-		c.latestSchema.ID = int(schemaID)
-		c.codec = currentCodec
+		c.latestSchema = schemaMeta
 	}
 
-	// Deserialize Avro binary data
-	native, _, err := currentCodec.NativeFromBinary(avroData)
-	if err != nil {
-		return Transaction{}, fmt.Errorf("failed to deserialize Avro data: %w", err)
+	// Deserialize Protobuf binary data
+	var txnProto transactionpb.Transaction
+	if err := proto.Unmarshal(protoData, &txnProto); err != nil {
+		return Transaction{}, fmt.Errorf("failed to deserialize Protobuf data: %w", err)
 	}
 
-	// Convert to map
-	txnMapTyped, ok := native.(map[string]interface{})
-	if !ok {
-		return Transaction{}, fmt.Errorf("deserialized data is not a map: %T", native)
-	}
-
-	// 🔍 Debug: Log all fields received (including extra fields if any)
-	if len(txnMapTyped) > 0 {
-		log.Printf("🔍 Raw deserialized fields: %v", txnMapTyped)
-	}
-
-	// Field names must match the schema in Schema Registry (snake_case)
-	var txn Transaction
-	if id, ok := txnMapTyped["id"].(string); ok {
-		txn.ID = id
-	}
-	if t, ok := txnMapTyped["type"].(string); ok {
-		txn.Type = t
-	}
-	if tid, ok := txnMapTyped["terminal_id"].(int64); ok {
-		txn.TerminalID = tid
-	} else if tid, ok := txnMapTyped["terminal_id"].(int32); ok {
-		txn.TerminalID = int64(tid)
-	}
-	if ra, ok := txnMapTyped["received_at"].(string); ok {
-		txn.ReceivedAt = ra
-	}
-
-	// ⚠️ Check if amount field exists (it shouldn't!)
-	if amount, exists := txnMapTyped["amount"]; exists {
-		log.Printf("⚠️  WARNING: amount field found in message: %v", amount)
-	} else {
-		// Only log for EXTRA_FIELD_TEST to show the issue
-		if txn.ID == "EXTRA_FIELD_TEST" {
-			log.Printf("❌ amount field MISSING! (was silently dropped by Avro)")
-			log.Printf("   Producer sent: amount=100.50")
-			log.Printf("   Consumer received: amount field not found")
-			log.Printf("   This is SILENT DATA LOSS! 🚨")
-		}
+	// Convert to Transaction struct
+	txn := Transaction{
+		ID:         txnProto.Id,
+		Type:       txnProto.Type,
+		TerminalID: txnProto.TerminalId,
+		ReceivedAt: txnProto.ReceivedAt,
 	}
 
 	return txn, nil
@@ -254,39 +209,35 @@ func (c *consumerImp) Process(txn Transaction) error {
 }
 
 // getOrRegisterDLQSchema gets existing DLQ schema or registers a new one
-func getOrRegisterDLQSchema(srClient schemaregistry.Client, subject string, schemaRegistryURL string) (schemaregistry.SchemaMetadata, *goavro.Codec, error) {
+func getOrRegisterDLQSchema(srClient schemaregistry.Client, subject string, schemaRegistryURL string) (schemaregistry.SchemaMetadata, error) {
 	// Try to get existing schema
 	dlqSchema, err := srClient.GetLatestSchemaMetadata(subject)
 	if err == nil {
-		// Schema exists, parse it
-		codec, err := goavro.NewCodec(dlqSchema.Schema)
-		if err != nil {
-			return schemaregistry.SchemaMetadata{}, nil, fmt.Errorf("failed to parse DLQ schema: %w", err)
-		}
-		return dlqSchema, codec, nil
+		// Schema exists
+		return dlqSchema, nil
 	}
 
 	// Schema doesn't exist, register it via HTTP API
-	// DLQ schema definition
-	dlqSchemaJSON := `{
-		"type": "record",
-		"name": "TransactionDLQ",
-		"namespace": "local_db",
-		"doc": "Dead Letter Queue schema for failed transaction messages",
-		"fields": [
-			{"name": "originalKey", "type": "string", "doc": "Original message key from the failed transaction"},
-			{"name": "originalValue", "type": "bytes", "doc": "Original message value (Avro binary format) from the failed transaction"},
-			{"name": "error", "type": "string", "doc": "Error message describing why the message failed"},
-			{"name": "originalSchemaId", "type": ["null", "int"], "default": null, "doc": "Schema ID of the original message (if available)"},
-			{"name": "failedAt", "type": "string", "doc": "Timestamp when the message failed (ISO 8601 format)"},
-			{"name": "retryCount", "type": ["null", "int"], "default": null, "doc": "Number of retry attempts before sending to DLQ"}
-		]
-	}`
+	// DLQ Protobuf schema definition (converted from .proto file)
+	dlqProtoSchema := `syntax = "proto3";
+
+package local_db;
+
+option go_package = "local_db/proto";
+
+message TransactionDLQ {
+  string original_key = 1;
+  bytes original_value = 2;
+  string error = 3;
+  int32 original_schema_id = 4;
+  string failed_at = 5;
+  int32 retry_count = 6;
+}`
 
 	// Register schema via HTTP API
-	schemaID, err := registerSchemaViaHTTP(schemaRegistryURL, subject, dlqSchemaJSON)
+	schemaID, err := registerSchemaViaHTTP(schemaRegistryURL, subject, dlqProtoSchema)
 	if err != nil {
-		return schemaregistry.SchemaMetadata{}, nil, fmt.Errorf("failed to register DLQ schema: %w", err)
+		return schemaregistry.SchemaMetadata{}, fmt.Errorf("failed to register DLQ schema: %w", err)
 	}
 
 	log.Printf("✅ DLQ schema registered (ID: %d)", schemaID)
@@ -296,16 +247,10 @@ func getOrRegisterDLQSchema(srClient schemaregistry.Client, subject string, sche
 	time.Sleep(100 * time.Millisecond)
 	dlqSchema, err = srClient.GetLatestSchemaMetadata(subject)
 	if err != nil {
-		return schemaregistry.SchemaMetadata{}, nil, fmt.Errorf("failed to get registered DLQ schema: %w", err)
+		return schemaregistry.SchemaMetadata{}, fmt.Errorf("failed to get registered DLQ schema: %w", err)
 	}
 
-	// Parse schema
-	codec, err := goavro.NewCodec(dlqSchemaJSON)
-	if err != nil {
-		return schemaregistry.SchemaMetadata{}, nil, fmt.Errorf("failed to parse DLQ schema: %w", err)
-	}
-
-	return dlqSchema, codec, nil
+	return dlqSchema, nil
 }
 
 // registerSchemaViaHTTP registers a schema via Schema Registry HTTP API
@@ -350,49 +295,36 @@ func registerSchemaViaHTTP(schemaRegistryURL, subject, schemaJSON string) (int, 
 	return result.ID, nil
 }
 
-// sendToDLQAvro sends a failed message to DLQ using Avro format
-func (c *consumerImp) sendToDLQAvro(msg *sarama.ConsumerMessage, errorMsg string, retryCount int) error {
+// sendToDLQProtobuf sends a failed message to DLQ using Protobuf format
+func (c *consumerImp) sendToDLQProtobuf(msg *sarama.ConsumerMessage, errorMsg string, retryCount int) error {
 	// Extract original schema ID if available
-	var originalSchemaID interface{} // For Avro union ["null", "int"]
+	var originalSchemaID int32
 	if len(msg.Value) >= 5 {
 		schemaID := int32(msg.Value[1])<<24 | int32(msg.Value[2])<<16 | int32(msg.Value[3])<<8 | int32(msg.Value[4])
-		id := int(schemaID)
-		// Avro union ["null", "int"] requires map format: {"int": value}
-		originalSchemaID = map[string]interface{}{"int": id}
-	} else {
-		// null value
-		originalSchemaID = nil
-	}
-
-	// Prepare retryCount as Avro union ["null", "int"]
-	var retryCountUnion interface{}
-	if retryCount > 0 {
-		retryCountUnion = map[string]interface{}{"int": retryCount}
-	} else {
-		retryCountUnion = nil
+		originalSchemaID = schemaID
 	}
 
 	// Prepare DLQ record
-	dlqRecord := map[string]interface{}{
-		"originalKey":      string(msg.Key),
-		"originalValue":    msg.Value, // Keep original binary data
-		"error":            errorMsg,
-		"originalSchemaId": originalSchemaID,
-		"failedAt":         time.Now().Format(time.RFC3339),
-		"retryCount":       retryCountUnion,
+	dlqRecord := &transactionpb.TransactionDLQ{
+		OriginalKey:      string(msg.Key),
+		OriginalValue:    msg.Value, // Keep original binary data
+		Error:            errorMsg,
+		OriginalSchemaId: int32(originalSchemaID),
+		FailedAt:         time.Now().Format(time.RFC3339),
+		RetryCount:       int32(retryCount),
 	}
 
-	// Serialize DLQ record to Avro binary
-	avroBytes, err := c.dlqCodec.BinaryFromNative(nil, dlqRecord)
+	// Serialize DLQ record to Protobuf binary
+	protoBytes, err := proto.Marshal(dlqRecord)
 	if err != nil {
 		return fmt.Errorf("failed to serialize DLQ record: %w", err)
 	}
 
-	// Create Confluent Schema Registry format: [magic byte][schema ID][avro data]
+	// Create Confluent Schema Registry format: [magic byte][schema ID][protobuf data]
 	var schemaBuf bytes.Buffer
 	schemaBuf.WriteByte(0) // magic byte
 	binary.Write(&schemaBuf, binary.BigEndian, int32(c.dlqSchema.ID))
-	schemaBuf.Write(avroBytes)
+	schemaBuf.Write(protoBytes)
 
 	valueBytes := schemaBuf.Bytes()
 

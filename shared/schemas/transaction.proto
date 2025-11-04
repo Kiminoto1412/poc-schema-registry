@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package local_db;
+
+option go_package = "local_db/proto";
+
+// Transaction represents a transaction message
+message Transaction {
+  string id = 1;
+  string type = 2;
+  int64 terminal_id = 3;
+  string received_at = 4;
+}
