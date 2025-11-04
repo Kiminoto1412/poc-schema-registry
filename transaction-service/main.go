@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"runtime"
 	"strings"
 	"time"
 
@@ -147,20 +148,56 @@ func main() {
 		ReceivedAt string `avro:"received_at"` // Map Go field "ReceivedAt" to Avro field "received_at"
 	}
 
-	transactions := []Transaction{
-		{ID: "1001", Type: "CONTROL", TerminalID: 1, ReceivedAt: time.Now().Format("2006-01-02 15:04:05")},
-		{ID: "1002", Type: "CONTROL", TerminalID: 2, ReceivedAt: time.Now().Format("2006-01-02 15:04:05")},
-		{ID: "1003", Type: "CONTROL", TerminalID: 3, ReceivedAt: time.Now().Format("2006-01-02 15:04:05")},
-		{ID: "FAIL_TEST", Type: "CONTROL", TerminalID: 999, ReceivedAt: time.Now().Format("2006-01-02 15:04:05")}, // 💥 This will fail at consumer processing (not validation)
-		{ID: "DLQ_TEST", Type: "CONTROL", TerminalID: 888, ReceivedAt: time.Now().Format("2006-01-02 15:04:05")},  // 💥 This will also fail at consumer processing (not validation)
-	}
+	// Transaction types สำหรับสร้างข้อมูลที่หลากหลาย
+	transactionTypes := []string{"CONTROL", "SALE", "RETURN", "VOID", "AUTHORIZE", "CAPTURE", "REFUND"}
+	numTransactions := 1_000_000 // 1 ล้าน records
+
+	log.Printf("📊 Generating %d transactions...", numTransactions)
+
+	// --- Resource tracking สำหรับ summary ---
+	startTime := time.Now()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	startMemAlloc := m.Alloc
+	startMemSys := m.Sys
+
+	// Statistics counters
+	var successCount int64
+	var failureCount int64
+	var validationFailCount int64
+	var serializationFailCount int64
+	var structConversionFailCount int64
 
 	// --- ส่ง message ---
-	for i, txn := range transactions {
-		// แปลง struct เป็น map โดยใช้ struct tags อัตโนมัติ		
+	for i := 0; i < numTransactions; i++ {
+		// สร้าง transaction แบบ dynamic
+		var txn Transaction
+
+		// สร้าง ID ที่ unique (TXN_0000001, TXN_0000002, ...)
+		txn.ID = fmt.Sprintf("TXN_%07d", i+1)
+
+		// ใช้ transaction type แบบวนรอบจาก array
+		txn.Type = transactionTypes[i%len(transactionTypes)]
+
+		// Terminal ID แบบสุ่มระหว่าง 1-1000
+		txn.TerminalID = int64((i % 1000) + 1)
+
+		// Timestamp ที่เพิ่มขึ้นเล็กน้อยสำหรับแต่ละ record
+		txn.ReceivedAt = time.Now().Add(time.Duration(i) * time.Millisecond).Format("2006-01-02 15:04:05")
+
+		// เพิ่ม special test cases ที่ตำแหน่งที่กำหนด
+		if i == 999998 {
+			txn.ID = "FAIL_TEST"
+			txn.TerminalID = 999
+		} else if i == 999999 {
+			txn.ID = "DLQ_TEST"
+			txn.TerminalID = 888
+		}
+		// แปลง struct เป็น map โดยใช้ struct tags อัตโนมัติ
 		record, err := structToAvroMap(txn)
 		if err != nil {
-			log.Printf("❌ Failed to convert struct to map for txn %d: %v", i, err)
+			structConversionFailCount++
+			log.Printf("❌ Failed to convert struct to map for txn %d: %v", i+1, err)
 			continue
 		}
 
@@ -168,7 +205,8 @@ func main() {
 		// Producer-side: Fail fast and return error (ไม่ส่งไป DLQ เพราะเป็นต้นทาง)
 		// DLQ จะใช้สำหรับ consumer-side failures เท่านั้น
 		if err := validateSchema(codec, record); err != nil {
-			log.Printf("❌ Schema validation failed for txn %d (ID: %s): %v", i, txn.ID, err)
+			validationFailCount++
+			log.Printf("❌ Schema validation failed for txn %d (ID: %s): %v", i+1, txn.ID, err)
 			log.Printf("   Record structure: %+v", record)
 			log.Printf("   Error: Message structure does not match Schema Registry schema")
 			log.Printf("   ⚠️  Producer should fix the data source - this is not a consumer failure")
@@ -179,7 +217,8 @@ func main() {
 		// Serialize ด้วย goavro (validation ผ่านแล้ว)
 		avroBytes, err := codec.BinaryFromNative(nil, record)
 		if err != nil {
-			log.Printf("❌ Avro serialization failed for txn %d: %v", i, err)
+			serializationFailCount++
+			log.Printf("❌ Avro serialization failed for txn %d: %v", i+1, err)
 			continue
 		}
 
@@ -189,8 +228,7 @@ func main() {
 		// Convert binary data to string for common library
 		// sarama.StringEncoder will convert string back to []byte correctly
 		valueString := string(valueBytes)
-		fmt.Println("valueBytes", valueBytes)
-		fmt.Println("valueString", valueString)
+		// Debug prints removed for performance (1M records)
 
 		// Send message using common library
 		result, err := kafkaClient.SendMessage(kafka.SendMessageParam{
@@ -200,15 +238,62 @@ func main() {
 		})
 
 		if err != nil {
-			log.Printf("❌ Failed to send txn %d: %v", i, err)
+			failureCount++
+			log.Printf("❌ Failed to send txn %d: %v", i+1, err)
 			continue
 		}
 
-		log.Printf("✅ Sent Txn[%d]: ID=%s Type=%s Terminal=%d (Partition: %d, Offset: %d)",
-			i+1, txn.ID, txn.Type, txn.TerminalID, result.Partition, result.Offset)
+		successCount++
 
-		time.Sleep(time.Second)
+		// Log progress every 10,000 records เพื่อไม่ให้ log เยอะเกินไป
+		if (i+1)%10000 == 0 || i < 5 || i >= numTransactions-2 {
+			log.Printf("✅ Progress: Sent %d/%d transactions | Last: ID=%s Type=%s Terminal=%d (Partition: %d, Offset: %d)",
+				i+1, numTransactions, txn.ID, txn.Type, txn.TerminalID, result.Partition, result.Offset)
+		}
+
+		// Sleep removed for performance - sending 1M records
 	}
+
+	// --- Resource Summary ---
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+	runtime.ReadMemStats(&m)
+	endMemAlloc := m.Alloc
+	endMemSys := m.Sys
+
+	memAllocUsed := endMemAlloc - startMemAlloc
+	memSysUsed := endMemSys - startMemSys
+
+	throughput := float64(successCount) / duration.Seconds()
+
+	log.Println("\n" + strings.Repeat("=", 80))
+	log.Println("📊 RESOURCE USAGE SUMMARY")
+	log.Println(strings.Repeat("=", 80))
+	log.Printf("⏱️  Execution Time:")
+	log.Printf("   • Total Duration:     %v", duration)
+	log.Printf("   • Duration (seconds): %.2f seconds", duration.Seconds())
+	log.Printf("   • Duration (minutes): %.2f minutes", duration.Minutes())
+	log.Println()
+	log.Printf("📈 Transaction Statistics:")
+	log.Printf("   • Total Attempted:    %d", numTransactions)
+	log.Printf("   • Successfully Sent:  %d", successCount)
+	log.Printf("   • Failed to Send:     %d", failureCount)
+	log.Printf("   • Validation Failed: %d", validationFailCount)
+	log.Printf("   • Serialization Failed: %d", serializationFailCount)
+	log.Printf("   • Struct Conversion Failed: %d", structConversionFailCount)
+	log.Printf("   • Success Rate:       %.2f%%", float64(successCount)/float64(numTransactions)*100)
+	log.Println()
+	log.Printf("⚡ Performance Metrics:")
+	log.Printf("   • Throughput:         %.2f transactions/second", throughput)
+	log.Printf("   • Avg Time per Record: %.4f ms", float64(duration.Milliseconds())/float64(numTransactions))
+	log.Println()
+	log.Printf("💾 Memory Usage:")
+	log.Printf("   • Memory Allocated:   %d bytes (%.2f MB)", memAllocUsed, float64(memAllocUsed)/1024/1024)
+	log.Printf("   • System Memory:      %d bytes (%.2f MB)", memSysUsed, float64(memSysUsed)/1024/1024)
+	log.Printf("   • Current Heap Alloc: %d bytes (%.2f MB)", m.Alloc, float64(m.Alloc)/1024/1024)
+	log.Printf("   • Current Sys Memory: %d bytes (%.2f MB)", m.Sys, float64(m.Sys)/1024/1024)
+	log.Printf("   • GC Cycles:          %d", m.NumGC)
+	log.Println(strings.Repeat("=", 80))
 
 	log.Println("✅ All valid transactions sent successfully!")
 
