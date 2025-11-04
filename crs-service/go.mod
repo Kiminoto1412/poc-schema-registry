@@ -5,7 +5,6 @@ go 1.24.2
 require (
 	github.com/IBM/sarama v1.45.2
 	github.com/confluentinc/confluent-kafka-go/v2 v2.3.0
-	github.com/linkedin/goavro/v2 v2.14.1
 	gitlab.bigc-cs.com/pos-transformation/pos-go-common v0.0.0
 )
 

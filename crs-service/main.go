@@ -17,7 +17,6 @@ import (
 
 	"github.com/IBM/sarama"
 	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
-	"github.com/linkedin/goavro/v2"
 	"gitlab.bigc-cs.com/pos-transformation/pos-go-common/kafka"
 )
 
@@ -49,11 +48,9 @@ type consumerImp struct {
 	kafka        kafka.Kafka
 	srClient     schemaregistry.Client
 	latestSchema schemaregistry.SchemaMetadata
-	codec        *goavro.Codec
 	subject      string
-	// DLQ Avro support
+	// DLQ JSON Schema support
 	dlqSchema  schemaregistry.SchemaMetadata
-	dlqCodec   *goavro.Codec
 	dlqSubject string
 }
 
@@ -68,18 +65,18 @@ func NewConsumer(
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify Schema Registry connection: %w", err)
 	}
-	log.Printf("✅ Schema Registry connection verified (subject: %s, schema ID: %d)", subject, latestSchema.ID)
 
-	// Parse schema ด้วย goavro
-	codec, err := goavro.NewCodec(latestSchema.Schema)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse schema: %w", err)
+	// ตรวจสอบว่าเป็น JSON Schema หรือไม่
+	if latestSchema.SchemaType != "JSON" {
+		return nil, fmt.Errorf("schema is not JSON Schema, got: %s. Please register JSON Schema first", latestSchema.SchemaType)
 	}
-	log.Println("✅ Avro codec created successfully")
+
+	log.Printf("✅ Schema Registry connection verified (subject: %s, schema ID: %d, type: %s)", subject, latestSchema.ID, latestSchema.SchemaType)
+	log.Println("✅ JSON Schema loaded successfully")
 
 	// Load DLQ schema (get or register)
 	dlqSubject := fmt.Sprintf("%s-value", cfg.TopicDLQ)
-	dlqSchema, dlqCodec, err := getOrRegisterDLQSchema(srClient, dlqSubject, cfg.SchemaRegistryURL)
+	dlqSchema, err := getOrRegisterDLQSchema(srClient, dlqSubject, cfg.SchemaRegistryURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup DLQ schema: %w", err)
 	}
@@ -90,10 +87,8 @@ func NewConsumer(
 		kafka:        kafkaClient,
 		srClient:     srClient,
 		latestSchema: latestSchema,
-		codec:        codec,
 		subject:      subject,
 		dlqSchema:    dlqSchema,
-		dlqCodec:     dlqCodec,
 		dlqSubject:   dlqSubject,
 	}, nil
 }
@@ -106,7 +101,7 @@ func (c *consumerImp) Consume(ctx context.Context) {
 
 		c.kafka.RetryHandler(msg,
 			func(m *sarama.ConsumerMessage) error {
-				// Deserialize Avro message
+				// Deserialize JSON Schema message
 				txn, err := c.deserializeMessage(m)
 				if err != nil {
 					log.Printf("❌ deserialize message error: %v", err)
@@ -122,11 +117,11 @@ func (c *consumerImp) Consume(ctx context.Context) {
 				return nil
 			},
 			func(m *sarama.ConsumerMessage, errMsg string) {
-				// Send to DLQ using Avro format
+				// Send to DLQ using JSON Schema format
 				retryCount := 3 // Default retry count from config
-				if err := c.sendToDLQAvro(m, errMsg, retryCount); err != nil {
+				if err := c.sendToDLQJSON(m, errMsg, retryCount); err != nil {
 					log.Printf("❌ send to dlq error: %v", err)
-					// Fallback to JSON format if Avro fails
+					// Fallback to plain JSON format if JSON Schema fails
 					_, fallbackErr := c.kafka.SendToDLQ(kafka.SendToDLQParam{
 						TopicDlq:     c.cfg.TopicDLQ,
 						Msg:          m,
@@ -136,7 +131,7 @@ func (c *consumerImp) Consume(ctx context.Context) {
 						log.Printf("❌ fallback DLQ also failed: %v", fallbackErr)
 					}
 				} else {
-					log.Printf("⚠️  message sent to DLQ (Avro): %s (error: %s)", string(m.Key), errMsg)
+					log.Printf("⚠️  message sent to DLQ (JSON Schema): %s (error: %s)", string(m.Key), errMsg)
 				}
 			},
 		)
@@ -151,21 +146,20 @@ func (c *consumerImp) Consume(ctx context.Context) {
 }
 
 func (c *consumerImp) deserializeMessage(msg *sarama.ConsumerMessage) (Transaction, error) {
-	// Extract Schema Registry header: [magic byte][schema ID][avro data]
+	// Extract Schema Registry header: [magic byte][schema ID][json data]
 	if len(msg.Value) < 5 {
 		return Transaction{}, errors.New("message too short")
 	}
 
 	magicByte := msg.Value[0]
 	schemaID := int32(msg.Value[1])<<24 | int32(msg.Value[2])<<16 | int32(msg.Value[3])<<8 | int32(msg.Value[4])
-	avroData := msg.Value[5:]
+	jsonData := msg.Value[5:]
 
 	if magicByte != 0 {
 		return Transaction{}, fmt.Errorf("invalid magic byte: 0x%02x", magicByte)
 	}
 
-	currentCodec := c.codec
-	// Verify schema ID matches
+	// Verify schema ID matches (optional: fetch if different)
 	if int(schemaID) != c.latestSchema.ID {
 		log.Printf("⚠️  Schema ID mismatch: expected %d, got %d", c.latestSchema.ID, schemaID)
 		// Try to fetch the correct schema
@@ -173,60 +167,21 @@ func (c *consumerImp) deserializeMessage(msg *sarama.ConsumerMessage) (Transacti
 		if err != nil {
 			return Transaction{}, fmt.Errorf("failed to fetch schema ID %d: %w", schemaID, err)
 		}
-		currentCodec, err = goavro.NewCodec(schemaMeta.Schema)
-		if err != nil {
-			return Transaction{}, fmt.Errorf("failed to parse schema ID %d: %w", schemaID, err)
+		// Verify it's still JSON Schema
+		if schemaMeta.SchemaType != "JSON" {
+			return Transaction{}, fmt.Errorf("schema ID %d is not JSON Schema, got: %s", schemaID, schemaMeta.SchemaType)
 		}
-		c.latestSchema.ID = int(schemaID)
-		c.codec = currentCodec
+		c.latestSchema = schemaMeta
 	}
 
-	// Deserialize Avro binary data
-	native, _, err := currentCodec.NativeFromBinary(avroData)
-	if err != nil {
-		return Transaction{}, fmt.Errorf("failed to deserialize Avro data: %w", err)
-	}
-
-	// Convert to map
-	txnMapTyped, ok := native.(map[string]interface{})
-	if !ok {
-		return Transaction{}, fmt.Errorf("deserialized data is not a map: %T", native)
-	}
-
-	// 🔍 Debug: Log all fields received (including extra fields if any)
-	if len(txnMapTyped) > 0 {
-		log.Printf("🔍 Raw deserialized fields: %v", txnMapTyped)
-	}
-
-	// Field names must match the schema in Schema Registry (snake_case)
+	// Deserialize JSON
 	var txn Transaction
-	if id, ok := txnMapTyped["id"].(string); ok {
-		txn.ID = id
-	}
-	if t, ok := txnMapTyped["type"].(string); ok {
-		txn.Type = t
-	}
-	if tid, ok := txnMapTyped["terminal_id"].(int64); ok {
-		txn.TerminalID = tid
-	} else if tid, ok := txnMapTyped["terminal_id"].(int32); ok {
-		txn.TerminalID = int64(tid)
-	}
-	if ra, ok := txnMapTyped["received_at"].(string); ok {
-		txn.ReceivedAt = ra
+	if err := json.Unmarshal(jsonData, &txn); err != nil {
+		return Transaction{}, fmt.Errorf("failed to deserialize JSON: %w", err)
 	}
 
-	// ⚠️ Check if amount field exists (it shouldn't!)
-	if amount, exists := txnMapTyped["amount"]; exists {
-		log.Printf("⚠️  WARNING: amount field found in message: %v", amount)
-	} else {
-		// Only log for EXTRA_FIELD_TEST to show the issue
-		if txn.ID == "EXTRA_FIELD_TEST" {
-			log.Printf("❌ amount field MISSING! (was silently dropped by Avro)")
-			log.Printf("   Producer sent: amount=100.50")
-			log.Printf("   Consumer received: amount field not found")
-			log.Printf("   This is SILENT DATA LOSS! 🚨")
-		}
-	}
+	// 🔍 Debug: Log all fields received
+	log.Printf("🔍 Raw deserialized JSON: %s", string(jsonData))
 
 	return txn, nil
 }
@@ -254,39 +209,76 @@ func (c *consumerImp) Process(txn Transaction) error {
 }
 
 // getOrRegisterDLQSchema gets existing DLQ schema or registers a new one
-func getOrRegisterDLQSchema(srClient schemaregistry.Client, subject string, schemaRegistryURL string) (schemaregistry.SchemaMetadata, *goavro.Codec, error) {
+func getOrRegisterDLQSchema(srClient schemaregistry.Client, subject string, schemaRegistryURL string) (schemaregistry.SchemaMetadata, error) {
 	// Try to get existing schema
 	dlqSchema, err := srClient.GetLatestSchemaMetadata(subject)
 	if err == nil {
-		// Schema exists, parse it
-		codec, err := goavro.NewCodec(dlqSchema.Schema)
-		if err != nil {
-			return schemaregistry.SchemaMetadata{}, nil, fmt.Errorf("failed to parse DLQ schema: %w", err)
+		// Schema exists, verify it's JSON Schema
+		// Note: SchemaType might be empty string for old Avro schemas
+		if dlqSchema.SchemaType != "" && dlqSchema.SchemaType != "JSON" {
+			return schemaregistry.SchemaMetadata{}, fmt.Errorf("existing DLQ schema is not JSON Schema, got: %s. Please delete the old schema first", dlqSchema.SchemaType)
 		}
-		return dlqSchema, codec, nil
+		// If SchemaType is empty or JSON, check if it's actually JSON Schema by examining the schema content
+		// For now, assume empty SchemaType means Avro (old format), so we'll delete and re-register
+		if dlqSchema.SchemaType == "" {
+			log.Printf("⚠️  Found schema with empty type (likely Avro), deleting and re-registering as JSON Schema...")
+			// Delete the old schema subject
+			deleteURL := fmt.Sprintf("%s/subjects/%s", schemaRegistryURL, subject)
+			req, _ := http.NewRequest("DELETE", deleteURL, nil)
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+			}
+			// Wait a bit for deletion to propagate
+			time.Sleep(200 * time.Millisecond)
+		} else {
+			// SchemaType is JSON, use it
+			return dlqSchema, nil
+		}
 	}
 
-	// Schema doesn't exist, register it via HTTP API
-	// DLQ schema definition
+	// Schema doesn't exist or was deleted, register it via HTTP API
+	// DLQ JSON Schema definition
 	dlqSchemaJSON := `{
-		"type": "record",
-		"name": "TransactionDLQ",
-		"namespace": "local_db",
-		"doc": "Dead Letter Queue schema for failed transaction messages",
-		"fields": [
-			{"name": "originalKey", "type": "string", "doc": "Original message key from the failed transaction"},
-			{"name": "originalValue", "type": "bytes", "doc": "Original message value (Avro binary format) from the failed transaction"},
-			{"name": "error", "type": "string", "doc": "Error message describing why the message failed"},
-			{"name": "originalSchemaId", "type": ["null", "int"], "default": null, "doc": "Schema ID of the original message (if available)"},
-			{"name": "failedAt", "type": "string", "doc": "Timestamp when the message failed (ISO 8601 format)"},
-			{"name": "retryCount", "type": ["null", "int"], "default": null, "doc": "Number of retry attempts before sending to DLQ"}
-		]
+		"$schema": "http://json-schema.org/draft-07/schema#",
+		"type": "object",
+		"title": "TransactionDLQ",
+		"description": "Dead Letter Queue schema for failed transaction messages",
+		"properties": {
+			"originalKey": {
+				"type": "string",
+				"description": "Original message key from the failed transaction"
+			},
+			"originalValue": {
+				"type": "string",
+				"description": "Original message value (base64 encoded JSON Schema format) from the failed transaction"
+			},
+			"error": {
+				"type": "string",
+				"description": "Error message describing why the message failed"
+			},
+			"originalSchemaId": {
+				"type": ["integer", "null"],
+				"description": "Schema ID of the original message (if available)"
+			},
+			"failedAt": {
+				"type": "string",
+				"format": "date-time",
+				"description": "Timestamp when the message failed (ISO 8601 format)"
+			},
+			"retryCount": {
+				"type": ["integer", "null"],
+				"description": "Number of retry attempts before sending to DLQ"
+			}
+		},
+		"required": ["originalKey", "originalValue", "error", "failedAt"]
 	}`
 
-	// Register schema via HTTP API
-	schemaID, err := registerSchemaViaHTTP(schemaRegistryURL, subject, dlqSchemaJSON)
+	// Register schema via HTTP API with JSON Schema type
+	schemaID, err := registerJSONSchemaViaHTTP(schemaRegistryURL, subject, dlqSchemaJSON)
 	if err != nil {
-		return schemaregistry.SchemaMetadata{}, nil, fmt.Errorf("failed to register DLQ schema: %w", err)
+		return schemaregistry.SchemaMetadata{}, fmt.Errorf("failed to register DLQ schema: %w", err)
 	}
 
 	log.Printf("✅ DLQ schema registered (ID: %d)", schemaID)
@@ -296,25 +288,20 @@ func getOrRegisterDLQSchema(srClient schemaregistry.Client, subject string, sche
 	time.Sleep(100 * time.Millisecond)
 	dlqSchema, err = srClient.GetLatestSchemaMetadata(subject)
 	if err != nil {
-		return schemaregistry.SchemaMetadata{}, nil, fmt.Errorf("failed to get registered DLQ schema: %w", err)
+		return schemaregistry.SchemaMetadata{}, fmt.Errorf("failed to get registered DLQ schema: %w", err)
 	}
 
-	// Parse schema
-	codec, err := goavro.NewCodec(dlqSchemaJSON)
-	if err != nil {
-		return schemaregistry.SchemaMetadata{}, nil, fmt.Errorf("failed to parse DLQ schema: %w", err)
-	}
-
-	return dlqSchema, codec, nil
+	return dlqSchema, nil
 }
 
-// registerSchemaViaHTTP registers a schema via Schema Registry HTTP API
-func registerSchemaViaHTTP(schemaRegistryURL, subject, schemaJSON string) (int, error) {
+// registerJSONSchemaViaHTTP registers a JSON Schema via Schema Registry HTTP API
+func registerJSONSchemaViaHTTP(schemaRegistryURL, subject, schemaJSON string) (int, error) {
 	url := fmt.Sprintf("%s/subjects/%s/versions", schemaRegistryURL, subject)
 
-	// Schema Registry expects the schema as a JSON-escaped string
-	requestBody := map[string]string{
-		"schema": schemaJSON,
+	// Schema Registry expects the schema as a JSON-escaped string with schemaType
+	requestBody := map[string]interface{}{
+		"schema":     schemaJSON,
+		"schemaType": "JSON",
 	}
 
 	jsonBody, err := json.Marshal(requestBody)
@@ -350,49 +337,43 @@ func registerSchemaViaHTTP(schemaRegistryURL, subject, schemaJSON string) (int, 
 	return result.ID, nil
 }
 
-// sendToDLQAvro sends a failed message to DLQ using Avro format
-func (c *consumerImp) sendToDLQAvro(msg *sarama.ConsumerMessage, errorMsg string, retryCount int) error {
+// sendToDLQJSON sends a failed message to DLQ using JSON Schema format
+func (c *consumerImp) sendToDLQJSON(msg *sarama.ConsumerMessage, errorMsg string, retryCount int) error {
 	// Extract original schema ID if available
-	var originalSchemaID interface{} // For Avro union ["null", "int"]
+	var originalSchemaID *int
 	if len(msg.Value) >= 5 {
 		schemaID := int32(msg.Value[1])<<24 | int32(msg.Value[2])<<16 | int32(msg.Value[3])<<8 | int32(msg.Value[4])
 		id := int(schemaID)
-		// Avro union ["null", "int"] requires map format: {"int": value}
-		originalSchemaID = map[string]interface{}{"int": id}
-	} else {
-		// null value
-		originalSchemaID = nil
-	}
-
-	// Prepare retryCount as Avro union ["null", "int"]
-	var retryCountUnion interface{}
-	if retryCount > 0 {
-		retryCountUnion = map[string]interface{}{"int": retryCount}
-	} else {
-		retryCountUnion = nil
+		originalSchemaID = &id
 	}
 
 	// Prepare DLQ record
 	dlqRecord := map[string]interface{}{
-		"originalKey":      string(msg.Key),
-		"originalValue":    msg.Value, // Keep original binary data
-		"error":            errorMsg,
-		"originalSchemaId": originalSchemaID,
-		"failedAt":         time.Now().Format(time.RFC3339),
-		"retryCount":       retryCountUnion,
+		"originalKey":   string(msg.Key),
+		"originalValue": string(msg.Value), // Keep original data as string (base64 could be used but string is simpler)
+		"error":         errorMsg,
+		"failedAt":      time.Now().Format(time.RFC3339),
 	}
 
-	// Serialize DLQ record to Avro binary
-	avroBytes, err := c.dlqCodec.BinaryFromNative(nil, dlqRecord)
+	// Add optional fields if they have values
+	if originalSchemaID != nil {
+		dlqRecord["originalSchemaId"] = *originalSchemaID
+	}
+	if retryCount > 0 {
+		dlqRecord["retryCount"] = retryCount
+	}
+
+	// Serialize DLQ record to JSON
+	jsonBytes, err := json.Marshal(dlqRecord)
 	if err != nil {
 		return fmt.Errorf("failed to serialize DLQ record: %w", err)
 	}
 
-	// Create Confluent Schema Registry format: [magic byte][schema ID][avro data]
+	// Create Confluent Schema Registry format: [magic byte][schema ID][json data]
 	var schemaBuf bytes.Buffer
 	schemaBuf.WriteByte(0) // magic byte
 	binary.Write(&schemaBuf, binary.BigEndian, int32(c.dlqSchema.ID))
-	schemaBuf.Write(avroBytes)
+	schemaBuf.Write(jsonBytes)
 
 	valueBytes := schemaBuf.Bytes()
 
@@ -416,7 +397,7 @@ func main() {
 		GroupID:           "crs-service-group",
 	}
 
-	log.Println("🚀 CRS Service (Consumer with Schema Registry) starting...")
+	log.Println("🚀 CRS Service (Consumer with JSON Schema) starting...")
 
 	// Create Schema Registry client
 	srConfig := schemaregistry.NewConfig(cfg.SchemaRegistryURL)
