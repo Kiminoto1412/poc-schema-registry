@@ -3,100 +3,48 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
-	"reflect"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
-	"github.com/linkedin/goavro/v2"
+	"github.com/xeipuuv/gojsonschema"
 	"gitlab.bigc-cs.com/pos-transformation/pos-go-common/kafka"
 )
 
-// toSnakeCase converts PascalCase to snake_case
-// Example: TerminalID → terminal_id
-func toSnakeCase(s string) string {
-	var result strings.Builder
-	for i, r := range s {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			result.WriteByte('_')
-		}
-		if r >= 'A' && r <= 'Z' {
-			result.WriteRune(r + 32) // Convert to lowercase
-		} else {
-			result.WriteRune(r)
-		}
-	}
-	return result.String()
-}
-
-// validateSchema validates a record against the Avro schema before serialization
+// validateJSONSchema validates a JSON object against the JSON Schema
 // Note: Producer-side validation failures should fail fast and return error
 // DLQ is only for consumer-side processing failures (handled by CRS service)
-func validateSchema(codec *goavro.Codec, record map[string]interface{}) error {
-	// Try to serialize to a test buffer to validate the structure
-	// This will catch type mismatches and missing required fields
-	_, err := codec.BinaryFromNative(nil, record)
+func validateJSONSchema(schemaStr string, jsonData []byte) error {
+	schemaLoader := gojsonschema.NewStringLoader(schemaStr)
+	documentLoader := gojsonschema.NewBytesLoader(jsonData)
+
+	result, err := gojsonschema.Validate(schemaLoader, documentLoader)
 	if err != nil {
-		return fmt.Errorf("schema validation failed: %w", err)
+		return fmt.Errorf("schema validation error: %w", err)
 	}
+
+	if !result.Valid() {
+		var errors []string
+		for _, desc := range result.Errors() {
+			errors = append(errors, desc.String())
+		}
+		return fmt.Errorf("schema validation failed: %s", strings.Join(errors, "; "))
+	}
+
 	return nil
 }
 
-// structToAvroMap converts a struct to map[string]interface{} for Avro serialization
-// using struct tags to map Go field names to Avro field names
-// Example: ID string `avro:"id"` → map["id"] = struct.ID
-func structToAvroMap(v interface{}) (map[string]interface{}, error) {
-	rv := reflect.ValueOf(v)
-	if rv.Kind() == reflect.Ptr {
-		rv = rv.Elem()
-	}
-	if rv.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("expected struct, got %T", v)
-	}
-
-	rt := rv.Type()
-	result := make(map[string]interface{})
-
-	for i := 0; i < rv.NumField(); i++ {
-		field := rt.Field(i)
-		fieldValue := rv.Field(i)
-
-		// Get Avro field name from struct tag, fallback to field name
-		avroName := field.Tag.Get("avro")
-		if avroName == "" {
-			// Convert Go field name (PascalCase) to Avro name (snake_case)
-			avroName = toSnakeCase(field.Name)
-		}
-
-		// Skip unexported fields
-		if !fieldValue.CanInterface() {
-			continue
-		}
-
-		// Handle zero values - only include if not zero or if required
-		if fieldValue.IsZero() {
-			// Check if field has "omitempty" tag
-			if strings.Contains(field.Tag.Get("avro"), "omitempty") {
-				continue
-			}
-		}
-
-		result[avroName] = fieldValue.Interface()
-	}
-
-	return result, nil
-}
-
 // createConfluentFormat creates Confluent Schema Registry wire format:
-// [magic byte (1 byte)][schema ID (4 bytes)][avro data (variable)]
-func createConfluentFormat(schemaID int, avroBytes []byte) []byte {
+// [magic byte (1 byte)][schema ID (4 bytes)][json data (variable)]
+func createConfluentFormat(schemaID int, jsonBytes []byte) []byte {
 	var schemaBuf bytes.Buffer
 	schemaBuf.WriteByte(0) // magic byte
 	binary.Write(&schemaBuf, binary.BigEndian, int32(schemaID))
-	schemaBuf.Write(avroBytes)
+	schemaBuf.Write(jsonBytes) // JSON string bytes
 	return schemaBuf.Bytes()
 }
 
@@ -105,7 +53,7 @@ func main() {
 	schemaRegistryURL := "http://localhost:8083"
 	topic := "transactions"
 
-	log.Println("🚀 Transaction Service (Producer with Schema Registry) starting...")
+	log.Println("🚀 Transaction Service (Producer with JSON Schema) starting...")
 
 	// Create Schema Registry client
 	srClient, err := schemaregistry.NewClient(schemaregistry.NewConfig(schemaRegistryURL))
@@ -120,13 +68,12 @@ func main() {
 		log.Fatalf("❌ Failed to get schema: %v", err)
 	}
 
-	// Parse schema ด้วย goavro
-	codec, err := goavro.NewCodec(latestSchema.Schema)
-	if err != nil {
-		log.Fatalf("❌ Failed to parse schema: %v", err)
+	// ตรวจสอบว่าเป็น JSON Schema หรือไม่
+	if latestSchema.SchemaType != "JSON" {
+		log.Fatalf("❌ Schema is not JSON Schema, got: %s. Please register JSON Schema first.", latestSchema.SchemaType)
 	}
 
-	log.Printf("✅ Got schema ID: %d", latestSchema.ID)
+	log.Printf("✅ Got JSON Schema ID: %d", latestSchema.ID)
 
 	// --- Kafka producer using common library ---
 	kafkaClient, cleanup := kafka.NewKafka(kafka.KafkaConfig{
@@ -142,10 +89,10 @@ func main() {
 
 	// --- ตัวอย่างข้อมูล ---
 	type Transaction struct {
-		ID         string `avro:"id"`          // Map Go field "ID" to Avro field "id"
-		Type       string `avro:"type"`        // Map Go field "Type" to Avro field "type"
-		TerminalID int64  `avro:"terminal_id"` // Map Go field "TerminalID" to Avro field "terminal_id"
-		ReceivedAt string `avro:"received_at"` // Map Go field "ReceivedAt" to Avro field "received_at"
+		ID         string `json:"id"`          // JSON field name
+		Type       string `json:"type"`        // JSON field name
+		TerminalID int64  `json:"terminal_id"` // JSON field name
+		ReceivedAt string `json:"received_at"` // JSON field name
 	}
 
 	// Transaction types สำหรับสร้างข้อมูลที่หลากหลาย
@@ -166,7 +113,6 @@ func main() {
 	var failureCount int64
 	var validationFailCount int64
 	var serializationFailCount int64
-	var structConversionFailCount int64
 
 	// --- ส่ง message ---
 	for i := 0; i < numTransactions; i++ {
@@ -182,8 +128,8 @@ func main() {
 		// Terminal ID แบบสุ่มระหว่าง 1-1000
 		txn.TerminalID = int64((i % 1000) + 1)
 
-		// Timestamp ที่เพิ่มขึ้นเล็กน้อยสำหรับแต่ละ record
-		txn.ReceivedAt = time.Now().Add(time.Duration(i) * time.Millisecond).Format("2006-01-02 15:04:05")
+		// Timestamp ที่เพิ่มขึ้นเล็กน้อยสำหรับแต่ละ record (RFC3339 format for JSON Schema date-time)
+		txn.ReceivedAt = time.Now().Add(time.Duration(i) * time.Millisecond).Format(time.RFC3339)
 
 		// เพิ่ม special test cases ที่ตำแหน่งที่กำหนด
 		if i == 999998 {
@@ -193,37 +139,29 @@ func main() {
 			txn.ID = "DLQ_TEST"
 			txn.TerminalID = 888
 		}
-		// แปลง struct เป็น map โดยใช้ struct tags อัตโนมัติ
-		record, err := structToAvroMap(txn)
+
+		// Serialize เป็น JSON
+		jsonBytes, err := json.Marshal(txn)
 		if err != nil {
-			structConversionFailCount++
-			log.Printf("❌ Failed to convert struct to map for txn %d: %v", i+1, err)
+			serializationFailCount++
+			log.Printf("❌ JSON marshaling failed for txn %d: %v", i+1, err)
 			continue
 		}
 
 		// 🔍 Validate schema ก่อนส่ง message
 		// Producer-side: Fail fast and return error (ไม่ส่งไป DLQ เพราะเป็นต้นทาง)
 		// DLQ จะใช้สำหรับ consumer-side failures เท่านั้น
-		if err := validateSchema(codec, record); err != nil {
+		if err := validateJSONSchema(latestSchema.Schema, jsonBytes); err != nil {
 			validationFailCount++
 			log.Printf("❌ Schema validation failed for txn %d (ID: %s): %v", i+1, txn.ID, err)
-			log.Printf("   Record structure: %+v", record)
-			log.Printf("   Error: Message structure does not match Schema Registry schema")
+			log.Printf("   JSON data: %s", string(jsonBytes))
 			log.Printf("   ⚠️  Producer should fix the data source - this is not a consumer failure")
 			// ไม่ส่งไป DLQ เพราะเป็น producer (ต้นทาง) - ควรแก้ที่ source code
 			continue
 		}
 
-		// Serialize ด้วย goavro (validation ผ่านแล้ว)
-		avroBytes, err := codec.BinaryFromNative(nil, record)
-		if err != nil {
-			serializationFailCount++
-			log.Printf("❌ Avro serialization failed for txn %d: %v", i+1, err)
-			continue
-		}
-
-		// สร้าง Confluent Schema Registry format: [magic byte][schema ID][avro data]
-		valueBytes := createConfluentFormat(latestSchema.ID, avroBytes)
+		// สร้าง Confluent Schema Registry format: [magic byte][schema ID][json data]
+		valueBytes := createConfluentFormat(latestSchema.ID, jsonBytes)
 
 		// Convert binary data to string for common library
 		// sarama.StringEncoder will convert string back to []byte correctly
@@ -280,7 +218,6 @@ func main() {
 	log.Printf("   • Failed to Send:     %d", failureCount)
 	log.Printf("   • Validation Failed: %d", validationFailCount)
 	log.Printf("   • Serialization Failed: %d", serializationFailCount)
-	log.Printf("   • Struct Conversion Failed: %d", structConversionFailCount)
 	log.Printf("   • Success Rate:       %.2f%%", float64(successCount)/float64(numTransactions)*100)
 	log.Println()
 	log.Printf("⚡ Performance Metrics:")
@@ -308,10 +245,11 @@ func main() {
 	invalidRecord1 := map[string]interface{}{
 		"id":          "INVALID_001",
 		"type":        "CONTROL",
-		"terminal_id": int64(1),
-		// Missing "received_at" (Avro field name)
+		"terminal_id": 1,
+		// Missing "received_at"
 	}
-	if err := validateSchema(codec, invalidRecord1); err != nil {
+	invalidJSON1, _ := json.Marshal(invalidRecord1)
+	if err := validateJSONSchema(latestSchema.Schema, invalidJSON1); err != nil {
 		log.Printf("❌ Validation correctly caught missing field: %v", err)
 		log.Printf("   ✅ Correct behavior: Producer should fix data source, NOT send to DLQ")
 	} else {
@@ -319,14 +257,15 @@ func main() {
 	}
 
 	// Test case 2: Wrong field type
-	log.Println("\n📋 Test 2: Wrong field type (terminal_id should be int64, got string)")
+	log.Println("\n📋 Test 2: Wrong field type (terminal_id should be integer, got string)")
 	invalidRecord2 := map[string]interface{}{
 		"id":          "INVALID_002",
 		"type":        "CONTROL",
-		"terminal_id": "should_be_int64", // Wrong type!
-		"received_at": time.Now().Format("2006-01-02 15:04:05"),
+		"terminal_id": "should_be_integer", // Wrong type!
+		"received_at": time.Now().Format(time.RFC3339),
 	}
-	if err := validateSchema(codec, invalidRecord2); err != nil {
+	invalidJSON2, _ := json.Marshal(invalidRecord2)
+	if err := validateJSONSchema(latestSchema.Schema, invalidJSON2); err != nil {
 		log.Printf("❌ Validation correctly caught type mismatch: %v", err)
 		log.Printf("   ✅ Correct behavior: Producer should fix data source, NOT send to DLQ")
 	} else {
