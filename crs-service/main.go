@@ -68,6 +68,7 @@ func NewConsumer(
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify Schema Registry connection: %w", err)
 	}
+	fmt.Println(71, "latestSchema", latestSchema)
 	log.Printf("✅ Schema Registry connection verified (subject: %s, schema ID: %d)", subject, latestSchema.ID)
 
 	// Parse schema ด้วย goavro
@@ -76,7 +77,7 @@ func NewConsumer(
 		return nil, fmt.Errorf("failed to parse schema: %w", err)
 	}
 	log.Println("✅ Avro codec created successfully")
-
+	fmt.Println(80, "codec", codec)
 	// Load DLQ schema (get or register)
 	dlqSubject := fmt.Sprintf("%s-value", cfg.TopicDLQ)
 	dlqSchema, dlqCodec, err := getOrRegisterDLQSchema(srClient, dlqSubject, cfg.SchemaRegistryURL)
@@ -169,10 +170,11 @@ func (c *consumerImp) deserializeMessage(msg *sarama.ConsumerMessage) (Transacti
 	if int(schemaID) != c.latestSchema.ID {
 		log.Printf("⚠️  Schema ID mismatch: expected %d, got %d", c.latestSchema.ID, schemaID)
 		// Try to fetch the correct schema
-		schemaMeta, err := c.srClient.GetSchemaMetadata(c.subject, int(schemaID))
+		schemaMeta, err := c.srClient.GetBySubjectAndID(c.subject, int(schemaID))
 		if err != nil {
 			return Transaction{}, fmt.Errorf("failed to fetch schema ID %d: %w", schemaID, err)
 		}
+		fmt.Println(177, "schemaMeta", schemaMeta)
 		currentCodec, err = goavro.NewCodec(schemaMeta.Schema)
 		if err != nil {
 			return Transaction{}, fmt.Errorf("failed to parse schema ID %d: %w", schemaID, err)
