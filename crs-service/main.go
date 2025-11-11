@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -15,33 +16,14 @@ import (
 	"gitlab.bigc-cs.com/pos-transformation/pos-go-common/kafka"
 )
 
-// SchemaMetadata เก็บข้อมูล schema จาก Schema Registry (wrapper สำหรับ srclient.Schema)
-type SchemaMetadata struct {
-	Subject string
-	Version int
-	ID      int
-	Schema  string
-}
-
-// convertSchemaToMetadata แปลง srclient.Schema เป็น SchemaMetadata
-func convertSchemaToMetadata(schema *srclient.Schema, subject string) *SchemaMetadata {
-	if schema == nil {
-		return nil
-	}
-	return &SchemaMetadata{
-		Subject: subject,
-		Version: schema.Version(),
-		ID:      schema.ID(),
-		Schema:  schema.Schema(),
-	}
-}
-
 // Transaction represents the transaction data structure
 type Transaction struct {
-	ID         string
-	Type       string
-	TerminalID int64
-	ReceivedAt string
+	ID         string  `json:"id"`
+	Type       string  `json:"type"`
+	TerminalID int64   `json:"terminal_id"`
+	Mam        string  `json:"mam"`
+	ReceivedAt string  `json:"received_at"`
+	Amount     float64 `json:"amount"`
 }
 
 // Config holds application configuration
@@ -60,12 +42,11 @@ type Consumer interface {
 }
 
 type consumerImp struct {
-	cfg          *Config
-	kafka        kafka.Kafka
-	srClient     *srclient.SchemaRegistryClient
-	latestSchema *SchemaMetadata
-	codec        *goavro.Codec
-	subject      string
+	cfg      *Config
+	kafka    kafka.Kafka
+	srClient *srclient.SchemaRegistryClient
+	// Unified cache: schemaID -> codec
+	schemaCache map[int]*goavro.Codec // schemaID -> codec
 }
 
 func NewConsumer(
@@ -79,8 +60,8 @@ func NewConsumer(
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify Schema Registry connection: %w", err)
 	}
-	latestSchema := convertSchemaToMetadata(latestSchemaSR, subject)
-	log.Printf("✅ Schema Registry connection verified (subject: %s, schema ID: %d)", subject, latestSchema.ID)
+	latestSchemaID := latestSchemaSR.ID()
+	log.Printf("✅ Schema Registry connection verified (subject: %s, schema ID: %d)", subject, latestSchemaID)
 
 	// ใช้ schema.Codec() โดยตรงจาก srclient แทน goavro.NewCodec()
 	codec := latestSchemaSR.Codec()
@@ -89,13 +70,15 @@ func NewConsumer(
 	}
 	log.Println("✅ Avro codec created successfully")
 
+	// Initialize cache with latest schema codec
+	schemaCache := make(map[int]*goavro.Codec)
+	schemaCache[latestSchemaID] = codec
+
 	return &consumerImp{
-		cfg:          cfg,
-		kafka:        kafkaClient,
-		srClient:     srClient,
-		latestSchema: latestSchema,
-		codec:        codec,
-		subject:      subject,
+		cfg:         cfg,
+		kafka:       kafkaClient,
+		srClient:    srClient,
+		schemaCache: schemaCache,
 	}, nil
 }
 
@@ -151,23 +134,27 @@ func (c *consumerImp) deserialize(msgValue []byte) (Transaction, error) {
 		return Transaction{}, fmt.Errorf("invalid magic byte: 0x%02x", magicByte)
 	}
 
-	currentCodec := c.codec
-	// Verify schema ID matches
-	if int(schemaID) != c.latestSchema.ID {
-		log.Printf("⚠️  Schema ID mismatch: expected %d, got %d", c.latestSchema.ID, schemaID)
-		// Try to fetch the correct schema using srclient
-		schemaSR, err := c.srClient.GetSchema(int(schemaID))
+	schemaIDInt := int(schemaID)
+
+	// Get codec from unified cache (works for both latest and older schemas)
+	currentCodec, exists := c.schemaCache[schemaIDInt]
+	if !exists {
+		// Cache miss - fetch from Schema Registry
+		log.Printf("⚠️  Schema ID %d not in cache, fetching from Schema Registry...", schemaIDInt)
+		schemaSR, err := c.srClient.GetSchema(schemaIDInt)
 		if err != nil {
-			return Transaction{}, fmt.Errorf("failed to fetch schema ID %d: %w", schemaID, err)
+			return Transaction{}, fmt.Errorf("failed to fetch schema ID %d: %w", schemaIDInt, err)
 		}
-		// ใช้ schema.Codec() โดยตรงจาก srclient
+
+		// Get codec from schema
 		currentCodec = schemaSR.Codec()
 		if currentCodec == nil {
-			return Transaction{}, fmt.Errorf("failed to get codec from schema ID %d", schemaID)
+			return Transaction{}, fmt.Errorf("failed to get codec from schema ID %d", schemaIDInt)
 		}
-		c.latestSchema.ID = int(schemaID)
-		c.latestSchema.Schema = schemaSR.Schema()
-		c.codec = currentCodec
+
+		// Cache the codec for future use
+		c.schemaCache[schemaIDInt] = currentCodec
+		log.Printf("✅ Cached codec for schema ID %d", schemaIDInt)
 	}
 
 	// Deserialize Avro binary data
@@ -176,31 +163,29 @@ func (c *consumerImp) deserialize(msgValue []byte) (Transaction, error) {
 		return Transaction{}, fmt.Errorf("failed to deserialize Avro data: %w", err)
 	}
 
-	// Convert to map
-	txnMapTyped, ok := native.(map[string]interface{})
-	if !ok {
+	// Verify it's a map (Avro records always deserialize to map[string]interface{})
+	if _, ok := native.(map[string]interface{}); !ok {
 		return Transaction{}, fmt.Errorf("deserialized data is not a map: %T", native)
 	}
 
 	// 🔍 Debug: Log all fields received (including extra fields if any)
-	if len(txnMapTyped) > 0 {
-		log.Printf("🔍 Raw deserialized fields: %v", txnMapTyped)
+	// if txnMap, ok := native.(map[string]interface{}); ok && len(txnMap) > 0 {
+	// 	log.Printf("🔍 Raw deserialized fields: %v", txnMap)
+	// }
+
+	// Convert native (map[string]interface{}) to Transaction struct using JSON marshal/unmarshal
+	// This is cleaner and handles type conversions automatically
+	jsonBytes, err := json.Marshal(native)
+	if err != nil {
+		return Transaction{}, fmt.Errorf("failed to marshal native to JSON: %w", err)
 	}
 
-	// ⚠️ ตรวจสอบ field ที่ไม่ได้ register ใน schema ก่อน deserialize
-	if amount, exists := txnMapTyped["amount"]; exists {
-		log.Printf("⚠️  WARNING: Found 'amount' field in message: %v (type: %T)", amount, amount)
-		log.Printf("   ⚠️  This field was NOT in the registered schema!")
-		log.Printf("   ⚠️  This means the producer sent extra data that was silently dropped!")
+	var txn Transaction
+	if err := json.Unmarshal(jsonBytes, &txn); err != nil {
+		return Transaction{}, fmt.Errorf("failed to unmarshal JSON to Transaction: %w", err)
 	}
 
-	// Map Avro fields to Transaction struct
-	txn := Transaction{
-		ID:         getString(txnMapTyped, "id"),
-		Type:       getString(txnMapTyped, "type"),
-		TerminalID: getInt64(txnMapTyped, "terminal_id"),
-		ReceivedAt: getString(txnMapTyped, "received_at"),
-	}
+	fmt.Println("txn", txn)
 
 	return txn, nil
 }
@@ -280,29 +265,4 @@ func main() {
 	consumer.Consume(ctx)
 
 	log.Println("✅ Consumer stopped gracefully")
-}
-
-// getString extracts string value from map, returns empty string if not found or wrong type
-func getString(m map[string]interface{}, key string) string {
-	if val, ok := m[key]; ok {
-		if str, ok := val.(string); ok {
-			return str
-		}
-	}
-	return ""
-}
-
-// getInt64 extracts int64 value from map, handles both int32 and int64, returns 0 if not found or wrong type
-func getInt64(m map[string]interface{}, key string) int64 {
-	if val, ok := m[key]; ok {
-		switch v := val.(type) {
-		case int64:
-			return v
-		case int32:
-			return int64(v)
-		case int:
-			return int64(v)
-		}
-	}
-	return 0
 }
