@@ -4,6 +4,8 @@ go 1.24.2
 
 require (
 	github.com/linkedin/goavro/v2 v2.14.1
+	github.com/riferrei/srclient v0.7.4
+	github.com/wirelessr/avroschema v0.0.0-20250326014052-2f18cc0f8d38
 	gitlab.bigc-cs.com/pos-transformation/pos-go-common v0.0.0
 )
 
@@ -31,7 +33,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475 // indirect
-	github.com/riferrei/srclient v0.7.4 // indirect
 	github.com/rs/zerolog v1.34.0 // indirect
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect

@@ -13,81 +13,181 @@ import (
 
 	"github.com/linkedin/goavro/v2"
 	"github.com/riferrei/srclient"
+	"github.com/wirelessr/avroschema"
 	"gitlab.bigc-cs.com/pos-transformation/pos-go-common/kafka"
 )
 
-// generateAvroSchema สร้าง Avro schema JSON จาก struct type โดยใช้ reflection
-func generateAvroSchema(structType reflect.Type) string {
-	fields := make([]map[string]interface{}, 0)
+// --- ตัวอย่างข้อมูล ---
+type Transaction struct {
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	TerminalID int64  `json:"terminal_id"`
+	// ReceivedAt string   `json:"received_at"`
+	// Amount *float64 `json:"amount"`
+	// Status string   `json:"status"`
+	// Mam        string   `json:"mam,default=ACTIVE"`
+	// CreatedAt  string   `json:"created_at,default=eiei"`
+}
 
-	for i := 0; i < structType.NumField(); i++ {
-		field := structType.Field(i)
-		avroTag := field.Tag.Get("avro")
-		if avroTag == "" || avroTag == "-" {
+// addDefaultValues เพิ่ม default values ให้กับ schema JSON สำหรับ backward compatibility
+func addDefaultValues(schemaJSON string) (string, error) {
+	var schema map[string]interface{}
+	if err := json.Unmarshal([]byte(schemaJSON), &schema); err != nil {
+		return "", fmt.Errorf("failed to unmarshal schema: %w", err)
+	}
+
+	fields, ok := schema["fields"].([]interface{})
+	if !ok {
+		return "", fmt.Errorf("fields is not an array")
+	}
+
+	// Field names ที่ต้องการ default values
+	defaultValues := map[string]interface{}{
+		"created_at": "",
+		"status":     "ACTIVE",
+		"mam":        "ACTIVE",
+	}
+
+	// เพิ่ม default values ให้กับ fields
+	for i, field := range fields {
+		fieldMap, ok := field.(map[string]interface{})
+		if !ok {
 			continue
 		}
 
-		fieldDef := map[string]interface{}{"name": avroTag}
-		var avroType interface{}
-
-		switch field.Type.Kind() {
-		case reflect.String:
-			avroType = "string"
-		case reflect.Int64:
-			avroType = "long"
-		case reflect.Int32:
-			avroType = "int"
-		case reflect.Float64:
-			avroType = []interface{}{"null", "double"}
-			fieldDef["default"] = nil
-		case reflect.Float32:
-			avroType = []interface{}{"null", "float"}
-			fieldDef["default"] = nil
-		case reflect.Bool:
-			avroType = "boolean"
-		default:
-			avroType = "string"
+		fieldName, ok := fieldMap["name"].(string)
+		if !ok {
+			continue
 		}
-		fieldDef["type"] = avroType
-		fields = append(fields, fieldDef)
+
+		if defaultValue, exists := defaultValues[fieldName]; exists {
+			fieldMap["default"] = defaultValue
+			fields[i] = fieldMap
+		}
 	}
 
-	recordName := structType.Name()
-	if recordName == "" {
-		recordName = "Record"
+	schema["fields"] = fields
+
+	// แปลงกลับเป็น JSON string
+	modifiedJSON, err := json.Marshal(schema)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal modified schema: %w", err)
 	}
 
-	schemaJSON, _ := json.Marshal(map[string]interface{}{
-		"type":   "record",
-		"name":   recordName,
-		"fields": fields,
-	})
-	return string(schemaJSON)
+	return string(modifiedJSON), nil
+}
+
+// normalizeSchemaJSON ทำให้ schema JSON เป็นรูปแบบเดียวกันสำหรับการเปรียบเทียบ
+func normalizeSchemaJSON(schemaJSON string) (string, error) {
+	var schema map[string]interface{}
+	if err := json.Unmarshal([]byte(schemaJSON), &schema); err != nil {
+		return "", err
+	}
+
+	// Sort fields array by field name เพื่อให้เปรียบเทียบได้แม่นยำ
+	if fields, ok := schema["fields"].([]interface{}); ok {
+		// Convert to slice of maps for sorting
+		fieldMaps := make([]map[string]interface{}, len(fields))
+		for i, field := range fields {
+			if fieldMap, ok := field.(map[string]interface{}); ok {
+				fieldMaps[i] = fieldMap
+			}
+		}
+
+		// Sort by field name
+		for i := 0; i < len(fieldMaps)-1; i++ {
+			for j := i + 1; j < len(fieldMaps); j++ {
+				nameI, _ := fieldMaps[i]["name"].(string)
+				nameJ, _ := fieldMaps[j]["name"].(string)
+				if nameI > nameJ {
+					fieldMaps[i], fieldMaps[j] = fieldMaps[j], fieldMaps[i]
+				}
+			}
+		}
+
+		// Convert back to []interface{}
+		sortedFields := make([]interface{}, len(fieldMaps))
+		for i, fieldMap := range fieldMaps {
+			sortedFields[i] = fieldMap
+		}
+		schema["fields"] = sortedFields
+	}
+
+	normalized, err := json.Marshal(schema)
+	if err != nil {
+		return "", err
+	}
+	return string(normalized), nil
 }
 
 // ensureSchemaMatchesStruct ตรวจสอบและ register schema ถ้าไม่ตรงกับ struct
 func ensureSchemaMatchesStruct(srClient *srclient.SchemaRegistryClient, subject string, structType reflect.Type) (*srclient.Schema, *goavro.Codec, error) {
-	structSchemaJSON := generateAvroSchema(structType)
+	// แปลง struct -> Avro schema JSON
+	schemaJSON, err := avroschema.Reflect(&Transaction{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to reflect schema: %w", err)
+	}
+
+	// เพิ่ม default values สำหรับ backward compatibility
+	schemaJSON, err = addDefaultValues(schemaJSON)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to add default values: %w", err)
+	}
+
+	fmt.Println("schemaJSON:", schemaJSON)
 
 	// ดึง schema ที่มีอยู่
 	existingSchema, err := srClient.GetLatestSchema(subject)
 	if err != nil {
 		log.Printf("⚠️  Schema not found, registering new schema...")
-		return registerSchema(srClient, subject, structSchemaJSON)
+		return registerSchema(srClient, subject, schemaJSON)
 	}
 
-	// ตรวจสอบ compatibility
-	isCompatible, err := srClient.IsSchemaCompatible(subject, structSchemaJSON, fmt.Sprintf("%d", existingSchema.Version()), srclient.Avro)
-	if err != nil || !isCompatible {
+	existingSchemaJSON := existingSchema.Schema()
+	log.Printf("📋 Existing schema (ID: %d, Version: %d): %s", existingSchema.ID(), existingSchema.Version(), existingSchemaJSON)
+
+	// เปรียบเทียบ schema JSON โดยตรง (normalize ก่อนเปรียบเทียบ)
+	normalizedNew, err := normalizeSchemaJSON(schemaJSON)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to normalize new schema: %w", err)
+	}
+
+	normalizedExisting, err := normalizeSchemaJSON(existingSchemaJSON)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to normalize existing schema: %w", err)
+	}
+
+	// ถ้า schema ไม่ตรงกัน (แม้จะ compatible) ให้ register schema ใหม่
+	if normalizedNew != normalizedExisting {
+		log.Printf("⚠️  Schema structure changed (struct has new/modified fields), registering new version...")
+		log.Printf("   Old schema: %s", normalizedExisting)
+		log.Printf("   New schema: %s", normalizedNew)
+
+		// ตรวจสอบ compatibility ก่อน register
+		log.Printf("🔍 Checking compatibility:")
+		log.Printf("   Subject: %s", subject)
+		log.Printf("   Version: %d", existingSchema.Version())
+		log.Printf("   Schema to check: %s", schemaJSON)
+
+		// Debug: แสดง payload ที่จะส่งไป (format ที่ library จะสร้าง)
+		payloadJSON := fmt.Sprintf(`{"schema":%q,"schemaType":"AVRO"}`, schemaJSON)
+		log.Printf("   📤 Payload that will be sent: %s", payloadJSON)
+
+		isCompatible, err := srClient.IsSchemaCompatible(subject, schemaJSON, fmt.Sprintf("%d", existingSchema.Version()), srclient.Avro)
 		if err != nil {
-			log.Printf("⚠️  Schema compatibility check failed: %v", err)
-		} else {
-			log.Printf("⚠️  Schema not compatible, auto-registering new version...")
+			return nil, nil, fmt.Errorf("❌ Schema compatibility check failed: %v", err)
 		}
-		return registerSchema(srClient, subject, structSchemaJSON)
+		if !isCompatible {
+			return nil, nil, fmt.Errorf("❌ Schema is NOT backward compatible! Cannot register new version. Old schema has fields that new schema is missing")
+		}
+
+		log.Printf("   ✅ Compatibility check result: %v", isCompatible)
+
+		log.Printf("✅ Schema is backward compatible, registering new version...")
+		return registerSchema(srClient, subject, schemaJSON)
 	}
 
-	log.Printf("✅ Schema is compatible (ID: %d)", existingSchema.ID())
+	log.Printf("✅ Schema matches struct exactly (ID: %d, Version: %d)", existingSchema.ID(), existingSchema.Version())
 	codec := existingSchema.Codec()
 	if codec == nil {
 		return nil, nil, fmt.Errorf("failed to get codec from schema")
@@ -132,15 +232,19 @@ func main() {
 	// Enable codec creation เพื่อให้สามารถใช้ schema.Codec() ได้
 	srClient.CodecCreationEnabled(true)
 
-	// --- ตัวอย่างข้อมูล ---
-	type Transaction struct {
-		ID         string  `avro:"id"`          // Map Go field "ID" to Avro field "id"
-		Type       string  `avro:"type"`        // Map Go field "Type" to Avro field "type"
-		TerminalID int64   `avro:"terminal_id"` // Map Go field "TerminalID" to Avro field "terminal_id"
-		ReceivedAt string  `avro:"received_at"` // Map Go field "ReceivedAt" to Avro field "received_at"
-		Amount     float64 `avro:"amount"`      // Field ที่มีใน schema (union type)
-		Amount2    float64 `avro:"amount2"`     // Field ที่มีใน schema (union type)
-		Amount3    float64 `avro:"amount3"`     // Field ที่มีใน schema (union type)
+	// ตั้งค่า compatibility level เป็น BACKWARD สำหรับ subject
+	compatibilityLevel, err := srClient.ChangeSubjectCompatibilityLevel(topic, srclient.Forward)
+	if err != nil {
+		log.Printf("⚠️  Failed to set compatibility level (may already be set): %v", err)
+		// ตรวจสอบ compatibility level ปัจจุบัน
+		currentLevel, err := srClient.GetCompatibilityLevel(topic, true)
+		if err != nil {
+			log.Printf("⚠️  Failed to get compatibility level: %v", err)
+		} else {
+			log.Printf("📋 Current compatibility level: %s", *currentLevel)
+		}
+	} else {
+		log.Printf("✅ Set compatibility level to: %s", *compatibilityLevel)
 	}
 
 	// ตรวจสอบและ register schema ถ้าไม่ตรงกับ struct โดยใช้ reflection
@@ -197,10 +301,7 @@ func main() {
 		txn.TerminalID = int64((i % 1000) + 1)
 
 		// Timestamp ที่เพิ่มขึ้นเล็กน้อยสำหรับแต่ละ record
-		txn.ReceivedAt = time.Now().Add(time.Duration(i) * time.Millisecond).Format("2006-01-02 15:04:05")
-
-		// ⚠️ เพิ่ม field ใหม่ที่ยังไม่ได้ register ใน Schema Registry
-		txn.Amount = float64(i+1) * 100.50
+		// txn.ReceivedAt = time.Now().Add(time.Duration(i) * time.Millisecond).Format("2006-01-02 15:04:05")
 
 		// เพิ่ม special test cases ที่ตำแหน่งที่กำหนด
 		if i == 999998 {
@@ -212,7 +313,6 @@ func main() {
 		} else if i == 0 {
 			// Test case สำหรับแสดงปัญหา field ที่ไม่ได้ register
 			txn.ID = "EXTRA_FIELD_TEST"
-			txn.Amount = 100.50
 			log.Printf("⚠️  Test: Sending transaction with extra field 'amount' that is NOT in schema")
 		}
 
@@ -222,16 +322,7 @@ func main() {
 			"id":          txn.ID,
 			"type":        txn.Type,
 			"terminal_id": txn.TerminalID,
-			"received_at": txn.ReceivedAt,
-		}
-
-		// สำหรับ union type ["null", "double"] ใน Avro ต้องส่งเป็น map
-		// ถ้าเป็น null: nil
-		// ถ้าเป็น double: map[string]interface{}{"double": value}
-		if txn.Amount != 0 {
-			txnMap["amount"] = map[string]interface{}{"double": txn.Amount}
-		} else {
-			txnMap["amount"] = nil
+			// "received_at": txn.ReceivedAt,
 		}
 
 		// Debug: log สำหรับ test case
