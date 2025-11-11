@@ -11,7 +11,6 @@ import (
 	"syscall"
 
 	"github.com/IBM/sarama"
-	"github.com/linkedin/goavro/v2"
 	"github.com/riferrei/srclient"
 	"gitlab.bigc-cs.com/pos-transformation/pos-go-common/kafka"
 )
@@ -45,8 +44,6 @@ type consumerImp struct {
 	cfg      *Config
 	kafka    kafka.Kafka
 	srClient *srclient.SchemaRegistryClient
-	// Unified cache: schemaID -> codec
-	schemaCache map[int]*goavro.Codec // schemaID -> codec
 }
 
 func NewConsumer(
@@ -63,22 +60,17 @@ func NewConsumer(
 	latestSchemaID := latestSchemaSR.ID()
 	log.Printf("✅ Schema Registry connection verified (subject: %s, schema ID: %d)", subject, latestSchemaID)
 
-	// ใช้ schema.Codec() โดยตรงจาก srclient แทน goavro.NewCodec()
+	// Verify codec can be created (srclient will cache it internally)
 	codec := latestSchemaSR.Codec()
 	if codec == nil {
 		return nil, fmt.Errorf("failed to get codec from schema")
 	}
-	log.Println("✅ Avro codec created successfully")
-
-	// Initialize cache with latest schema codec
-	schemaCache := make(map[int]*goavro.Codec)
-	schemaCache[latestSchemaID] = codec
+	log.Println("✅ Avro codec created successfully (cached by srclient)")
 
 	return &consumerImp{
-		cfg:         cfg,
-		kafka:       kafkaClient,
-		srClient:    srClient,
-		schemaCache: schemaCache,
+		cfg:      cfg,
+		kafka:    kafkaClient,
+		srClient: srClient,
 	}, nil
 }
 
@@ -121,6 +113,15 @@ func (c *consumerImp) Consume(ctx context.Context) {
 }
 
 func (c *consumerImp) deserialize(msgValue []byte) (Transaction, error) {
+	// Check if message is Confluent wire format (starts with magic byte 0x00)
+	if len(msgValue) >= 5 && msgValue[0] == 0 {
+		return c.deserializeConfluentFormat(msgValue)
+	}
+
+	return Transaction{}, fmt.Errorf("unknown message format: first byte 0x%02x", msgValue[0])
+}
+
+func (c *consumerImp) deserializeConfluentFormat(msgValue []byte) (Transaction, error) {
 	// Extract Schema Registry header: [magic byte][schema ID][avro data]
 	if len(msgValue) < 5 {
 		return Transaction{}, errors.New("message too short")
@@ -136,25 +137,16 @@ func (c *consumerImp) deserialize(msgValue []byte) (Transaction, error) {
 
 	schemaIDInt := int(schemaID)
 
-	// Get codec from unified cache (works for both latest and older schemas)
-	currentCodec, exists := c.schemaCache[schemaIDInt]
-	if !exists {
-		// Cache miss - fetch from Schema Registry
-		log.Printf("⚠️  Schema ID %d not in cache, fetching from Schema Registry...", schemaIDInt)
-		schemaSR, err := c.srClient.GetSchema(schemaIDInt)
-		if err != nil {
-			return Transaction{}, fmt.Errorf("failed to fetch schema ID %d: %w", schemaIDInt, err)
-		}
+	// Get schema from Schema Registry (srclient will cache it internally)
+	schemaSR, err := c.srClient.GetSchema(schemaIDInt)
+	if err != nil {
+		return Transaction{}, fmt.Errorf("failed to fetch schema ID %d: %w", schemaIDInt, err)
+	}
 
-		// Get codec from schema
-		currentCodec = schemaSR.Codec()
-		if currentCodec == nil {
-			return Transaction{}, fmt.Errorf("failed to get codec from schema ID %d", schemaIDInt)
-		}
-
-		// Cache the codec for future use
-		c.schemaCache[schemaIDInt] = currentCodec
-		log.Printf("✅ Cached codec for schema ID %d", schemaIDInt)
+	// Get codec from schema (srclient caches codec when CodecCreationEnabled=true)
+	currentCodec := schemaSR.Codec()
+	if currentCodec == nil {
+		return Transaction{}, fmt.Errorf("failed to get codec from schema ID %d", schemaIDInt)
 	}
 
 	// Deserialize Avro binary data
@@ -168,13 +160,7 @@ func (c *consumerImp) deserialize(msgValue []byte) (Transaction, error) {
 		return Transaction{}, fmt.Errorf("deserialized data is not a map: %T", native)
 	}
 
-	// 🔍 Debug: Log all fields received (including extra fields if any)
-	// if txnMap, ok := native.(map[string]interface{}); ok && len(txnMap) > 0 {
-	// 	log.Printf("🔍 Raw deserialized fields: %v", txnMap)
-	// }
-
 	// Convert native (map[string]interface{}) to Transaction struct using JSON marshal/unmarshal
-	// This is cleaner and handles type conversions automatically
 	jsonBytes, err := json.Marshal(native)
 	if err != nil {
 		return Transaction{}, fmt.Errorf("failed to marshal native to JSON: %w", err)
@@ -184,8 +170,6 @@ func (c *consumerImp) deserialize(msgValue []byte) (Transaction, error) {
 	if err := json.Unmarshal(jsonBytes, &txn); err != nil {
 		return Transaction{}, fmt.Errorf("failed to unmarshal JSON to Transaction: %w", err)
 	}
-
-	fmt.Println("txn", txn)
 
 	return txn, nil
 }

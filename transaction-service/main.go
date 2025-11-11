@@ -17,7 +17,7 @@ type Transaction struct {
 	ID         string  `json:"id"`
 	Type       string  `json:"type"`
 	TerminalID int64   `json:"terminal_id"`
-	// Mam        string  `json:"mam"`
+	Mam        string  `json:"mam"`
 	// ReceivedAt string  `json:"received_at"`
 	// Amount     float64 `json:"amount"`
 }
@@ -124,13 +124,14 @@ func main() {
 		ID:         "TXN_0000001",
 		Type:       "SALE",
 		TerminalID: 2,
+		Mam:        "MAM_0000001",
 	}
 
 	txnMap := map[string]interface{}{
 		"id":          txn.ID,
 		"type":        txn.Type,
 		"terminal_id": txn.TerminalID,
-		// "mam":         txn.Mam,
+		"mam":         txn.Mam,
 		// "received_at": txn.ReceivedAt,
 		// "amount":      txn.Amount,
 	}
